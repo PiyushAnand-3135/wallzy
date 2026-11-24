@@ -1,0 +1,21 @@
+[package]
+name = "wallzy"
+version = "0.1.0"
+edition = "2024"
+description = "An open-source, Rust-based desktop wallpaper downloader and manager built with GPUI"
+license = "MIT"
+repository = "https://github.com/PiyushAnand/wallzy"
+keywords = ["wallpaper", "desktop", "gpui", "downloader", "manager"]
+categories = ["multimedia", "gui"]
+
+[dependencies]
+dirs = "6.0"
+gpui-kit = { version = "0.11.0", features = ["gpui-fast"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Compile UI/layout/image dependencies with full optimizations even in `cargo run`
+# so animations, scrolling, and image decoding stay buttery smooth during development.
+[profile.dev.package."*"]
+opt-level = 3
