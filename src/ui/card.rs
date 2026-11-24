@@ -39,10 +39,8 @@ pub fn render_card(
         .shadow_sm()
         .hover(|s| s.border_color(palette.accent).shadow_md())
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.open_dropdown = None;
-            this.preview_id = Some(id.clone());
-            cx.notify();
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_preview(id.clone(), window, cx);
         }))
         // Edge-to-edge Artwork (positioned absolutely so intrinsic dimensions never resize card)
         .when_some(image_path, |this, path| {

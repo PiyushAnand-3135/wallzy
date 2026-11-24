@@ -24,12 +24,16 @@ pub fn render_preview_modal(
     let id_fav = wp.id.clone();
     let id_del = wp.id.clone();
     let local_path = wp.local_path.clone();
-    let image_path = wp
+    let hd_path = wp
         .local_path
         .as_ref()
         .filter(|p| p.exists())
-        .or_else(|| wp.display_image_path())
-        .cloned();
+        .cloned()
+        .or_else(|| app.hd_preview_path(&wp.id));
+    let thumb_path = wp.display_image_path().cloned();
+    let show_thumb_underlay = thumb_path
+        .as_ref()
+        .is_some_and(|t| hd_path.as_ref() != Some(t));
     let tags = wp.tags.clone();
     let mono_font = app.typography.mono_font.clone();
 
@@ -50,7 +54,7 @@ pub fn render_preview_modal(
         .on_click(|_, _, cx| cx.stop_propagation())
         // Left: Fixed-Bounds High-Contrast Wallpaper Preview Canvas
         .child(
-            div()
+            image_cache(app.preview_image_cache.clone())
                 .relative()
                 .flex_1()
                 .min_w_0()
@@ -58,6 +62,7 @@ pub fn render_preview_modal(
                 .h_full()
                 .overflow_hidden()
                 .bg(rgb(0x08090c))
+                // Instant thumbnail underlay prevents black flashes while HD decodes
                 .child(
                     div()
                         .absolute()
@@ -67,16 +72,37 @@ pub fn render_preview_modal(
                         .items_center()
                         .justify_center()
                         .p_4()
-                        .when_some(image_path, |this, path| {
-                            this.child(
+                        .when(show_thumb_underlay, |this| {
+                            this.when_some(thumb_path, |this, path| {
+                                this.child(
+                                    img(path)
+                                        .size_full()
+                                        .max_w_full()
+                                        .max_h_full()
+                                        .object_fit(ObjectFit::Contain),
+                                )
+                            })
+                        }),
+                )
+                // Crystal-clear HD layer rendered cleanly over the placeholder once ready
+                .when_some(hd_path, |this, path| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p_4()
+                            .child(
                                 img(path)
                                     .size_full()
                                     .max_w_full()
                                     .max_h_full()
                                     .object_fit(ObjectFit::Contain),
-                            )
-                        }),
-                )
+                            ),
+                    )
+                })
                 // Previous / Next Carousel Arrows
                 .when(has_prev, |this| {
                     this.child(
@@ -97,8 +123,8 @@ pub fn render_preview_modal(
                             .justify_center()
                             .cursor_pointer()
                             .hover(|s| s.bg(rgba(0x0b0d12f2)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step_preview(-1, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.step_preview(-1, window, cx);
                             }))
                             .child(
                                 Icon::new(IconName::ChevronLeft)
@@ -126,8 +152,8 @@ pub fn render_preview_modal(
                             .justify_center()
                             .cursor_pointer()
                             .hover(|s| s.bg(rgba(0x0b0d12f2)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step_preview(1, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.step_preview(1, window, cx);
                             }))
                             .child(
                                 Icon::new(IconName::ChevronRight)
@@ -203,9 +229,8 @@ pub fn render_preview_modal(
                                                 .ghost()
                                                 .rounded(ButtonRounded::Large)
                                                 .icon(Icon::new(IconName::X))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.preview_id = None;
-                                                    cx.notify();
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.close_preview(window, cx);
                                                 })),
                                         ),
                                 )
@@ -314,7 +339,7 @@ pub fn render_preview_modal(
                                                     })
                                                     .on_click(cx.listener(
                                                         move |this, _, window, cx| {
-                                                            this.preview_id = None;
+                                                            this.close_preview(window, cx);
                                                             this.set_search_query(
                                                                 &tag_query, window, cx,
                                                             );
@@ -467,9 +492,8 @@ pub fn render_preview_modal(
         .items_center()
         .justify_center()
         .p_6()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.preview_id = None;
-            cx.notify();
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.close_preview(window, cx);
         }))
         .child(animated_dialog);
 

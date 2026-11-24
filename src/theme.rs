@@ -1,5 +1,7 @@
 use crate::models::{AccentColor, ThemeMode};
-use gpui_kit::component::{Colorize as _, Theme as ComponentTheme, ThemeMode as ComponentThemeMode};
+use gpui_kit::component::{
+    Colorize as _, Theme as ComponentTheme, ThemeMode as ComponentThemeMode,
+};
 use gpui_kit::*;
 
 /// Resolved UI and monospace font families selected from installed system fonts.

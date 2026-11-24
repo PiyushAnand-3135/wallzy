@@ -5,7 +5,11 @@ use crate::models::{
 use crate::providers::curated::CuratedProvider;
 use crate::providers::local::LocalProvider;
 use crate::providers::{ProviderQuery, WallpaperProvider, fetch_enabled_online};
-use crate::services::downloader::{execute_download, target_path_for};
+use crate::services::downloader::{execute_download_with_cache, target_path_for};
+use crate::services::preview_cache::{
+    MAX_CONCURRENT_HD_FETCHES, MAX_TEMP_HD_PREVIEWS, PrefetchPlan, RollingHdCache, ViewportMetrics,
+    cleanup_temp_hd_cache, compute_viewport_prefetch_plan, fetch_or_render_hd_preview,
+};
 use crate::services::storage::{
     LibraryState, load_library_state, load_settings, preview_cache_dir, reset_all_persisted_data,
     save_library_state, save_settings,
@@ -21,18 +25,18 @@ use crate::ui::{
     sidebar::render_sidebar,
     topbar::render_topbar,
 };
-use gpui_kit::assets::IconName;
 use gpui_kit::component::animation::{EffectTransition, ease_out_cubic};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollbarHandle as _;
-use gpui_kit::component::{Icon, TitleBar, VirtualListScrollHandle, WindowExt as _};
+use gpui_kit::component::{TitleBar, VirtualListScrollHandle, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Root GPUI view and application state coordinator for Wallzy.
@@ -47,8 +51,12 @@ pub struct WallzyApp {
     pub open_dropdown: Option<FilterDropdown>,
     pub is_fetching: bool,
     pub gallery_image_cache: Entity<RetainAllImageCache>,
+    pub preview_image_cache: Entity<RetainAllImageCache>,
     pub gallery_scroll: VirtualListScrollHandle,
     cached_visible: Rc<Vec<Wallpaper>>,
+    hd_cache: RollingHdCache,
+    needs_prefetch_sync: bool,
+    prefetch_generation: u64,
     smooth_scroll_y: f32,
     scroll_target_y: f32,
     scroll_animating: bool,
@@ -65,6 +73,7 @@ pub struct WallzyApp {
 
 impl WallzyApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cleanup_temp_hd_cache();
         let settings = load_settings();
         let library = load_library_state();
         let typography = ResolvedTypography::detect(cx);
@@ -123,6 +132,10 @@ impl WallzyApp {
         );
 
         let gallery_image_cache = RetainAllImageCache::new(cx);
+        let preview_image_cache = RetainAllImageCache::new(cx);
+        let quit_sub = cx.on_app_quit(|_, _| async {
+            cleanup_temp_hd_cache();
+        });
 
         let mut app = Self {
             active_nav: NavSection::Discover,
@@ -135,8 +148,12 @@ impl WallzyApp {
             open_dropdown: None,
             is_fetching: false,
             gallery_image_cache,
+            preview_image_cache,
             gallery_scroll: VirtualListScrollHandle::new(),
             cached_visible: Rc::new(Vec::new()),
+            hd_cache: RollingHdCache::new(MAX_TEMP_HD_PREVIEWS),
+            needs_prefetch_sync: true,
+            prefetch_generation: 0,
             smooth_scroll_y: 0.0,
             scroll_target_y: 0.0,
             scroll_animating: false,
@@ -146,10 +163,12 @@ impl WallzyApp {
             download_dir_input,
             local_dir_input,
             wallhaven_key_input,
-            _subscriptions: vec![search_sub],
+            _subscriptions: vec![search_sub, quit_sub],
         };
 
         app.reload_offline_catalog();
+        app.sync_hd_prefetch(window, cx);
+        app.fetch_online_providers_inner(Some(window), false, cx);
         app
     }
 
@@ -186,6 +205,160 @@ impl WallzyApp {
 
     pub fn invalidate_visible_cache(&mut self) {
         self.cached_visible = Rc::new(self.filtered_wallpapers());
+        self.needs_prefetch_sync = true;
+    }
+
+    /// Returns a pre-cached high-resolution preview file path for `id` if ready.
+    pub fn hd_preview_path(&self, id: &str) -> Option<PathBuf> {
+        self.hd_cache.get(id)
+    }
+
+    /// Returns a pre-cached high-resolution hero image path for the given wallpaper ID, if ready.
+    pub fn hero_image_override(&self, id: &str) -> Option<PathBuf> {
+        self.hd_cache.get(id)
+    }
+
+    /// Opens the preview modal and immediately prioritizes HD preview prefetch for it and its neighbors.
+    pub fn open_preview(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_dropdown = None;
+        self.preview_id = Some(id);
+        self.sync_hd_prefetch(window, cx);
+        cx.notify();
+    }
+
+    /// Closes the preview modal and drops decoded full-resolution modal textures from GPU memory.
+    pub fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_id = None;
+        self.preview_image_cache
+            .update(cx, |cache, cx| cache.clear(window, cx));
+        self.sync_hd_prefetch(window, cx);
+        cx.notify();
+    }
+
+    fn compute_current_prefetch_plan(&self, window: &Window) -> PrefetchPlan {
+        let scroll_y = (-f32::from(self.gallery_scroll.base_handle().offset().y)).max(0.0);
+        let bounds_h: f32 = self
+            .gallery_scroll
+            .base_handle()
+            .bounds()
+            .size
+            .height
+            .into();
+        let viewport_h = if bounds_h > 1.0 { bounds_h } else { 640.0 };
+        let viewport_w: f32 = window.viewport_size().width.into();
+        compute_viewport_prefetch_plan(
+            &self.cached_visible,
+            self.active_nav,
+            self.filter.active_filter_count() > 0,
+            self.preview_id.as_deref(),
+            ViewportMetrics {
+                scroll_offset_y: scroll_y,
+                viewport_w,
+                viewport_h,
+                density: self.settings.grid_density,
+            },
+        )
+    }
+
+    fn drop_preview_textures(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        self.preview_image_cache.update(cx, |cache, cx| {
+            for path in paths {
+                let res = Resource::Path(Arc::from(path.as_path()));
+                cache.remove(&res, window, cx);
+            }
+        });
+    }
+
+    /// Prefetches HD previews for visible + buffered wallpapers and evicts older temp files left behind.
+    pub fn sync_hd_prefetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let plan = self.compute_current_prefetch_plan(window);
+        let evicted = self
+            .hd_cache
+            .touch_and_prune(&plan.priority_ids, &plan.protected_ids);
+        self.drop_preview_textures(evicted, window, cx);
+
+        let win_handle = window.window_handle();
+        for id in &plan.priority_ids {
+            if self.hd_cache.active_fetches() >= MAX_CONCURRENT_HD_FETCHES {
+                break;
+            }
+            if !self.hd_cache.needs_fetch(id) {
+                continue;
+            }
+            let Some(wp) = self.wallpapers.iter().find(|w| &w.id == id).cloned() else {
+                continue;
+            };
+            if wp.local_path.as_ref().is_some_and(|p| p.exists())
+                || (!matches!(wp.source, WallpaperSource::Curated) && wp.download_url.is_none())
+            {
+                continue;
+            }
+
+            let target_id = wp.id.clone();
+            self.hd_cache.mark_loading(&target_id);
+            let entity = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let path = cx
+                    .background_executor()
+                    .spawn(async move { fetch_or_render_hd_preview(&wp) })
+                    .await;
+
+                let _ = win_handle.update(cx, |_, win, cx| {
+                    if let Some(entity) = entity.upgrade() {
+                        entity.update(cx, |app, cx| {
+                            let plan = app.compute_current_prefetch_plan(win);
+                            let should_repaint = app.preview_id.as_deref()
+                                == Some(target_id.as_str())
+                                || app
+                                    .cached_visible
+                                    .first()
+                                    .is_some_and(|w| w.id == target_id);
+                            let evicted =
+                                app.hd_cache
+                                    .finish_loading(&target_id, path, &plan.protected_ids);
+                            app.drop_preview_textures(evicted, win, cx);
+                            app.sync_hd_prefetch(win, cx);
+                            if should_repaint {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn schedule_scroll_prefetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
+        let generation = self.prefetch_generation;
+        let win_handle = window.window_handle();
+        let entity = cx.entity().downgrade();
+
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+
+            let _ = win_handle.update(cx, |_, win, cx| {
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(cx, |app, cx| {
+                        if app.prefetch_generation == generation && !app.scroll_animating {
+                            app.sync_hd_prefetch(win, cx);
+                        }
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     fn apply_persisted_flags(&mut self) {
@@ -296,6 +469,7 @@ impl WallzyApp {
             self.scroll_animating = true;
             self.schedule_smooth_scroll_frame(window, cx);
         }
+        self.schedule_scroll_prefetch(window, cx);
         cx.notify();
     }
 
@@ -331,6 +505,9 @@ impl WallzyApp {
 
                 this.gallery_scroll
                     .set_offset(point(px(0.), px(this.smooth_scroll_y)));
+                if !this.scroll_animating {
+                    this.sync_hd_prefetch(window, cx);
+                }
                 cx.notify();
             });
         });
@@ -369,6 +546,7 @@ impl WallzyApp {
 
     pub fn set_grid_density(&mut self, density: GridDensity, cx: &mut Context<Self>) {
         self.settings.grid_density = density;
+        self.needs_prefetch_sync = true;
         self.persist_settings();
         cx.notify();
     }
@@ -436,8 +614,9 @@ impl WallzyApp {
 
     pub fn refresh_catalog(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.reload_offline_catalog();
+        self.hd_cache.reset_failed();
         if self.settings.has_any_online_provider() {
-            self.fetch_online_providers(window, cx);
+            self.fetch_online_providers_inner(window, true, cx);
         } else if let Some(win) = window {
             win.push_notification(Notification::success("Local library rescanned"), cx);
         }
@@ -445,6 +624,15 @@ impl WallzyApp {
     }
 
     pub fn fetch_online_providers(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.fetch_online_providers_inner(window, true, cx);
+    }
+
+    fn fetch_online_providers_inner(
+        &mut self,
+        window: Option<&mut Window>,
+        notify_errors: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_fetching || !self.settings.has_any_online_provider() {
             return;
         }
@@ -516,7 +704,7 @@ impl WallzyApp {
                                 )),
                                 cx,
                             );
-                        } else if !errors.is_empty() {
+                        } else if notify_errors && !errors.is_empty() {
                             win.push_notification(
                                 Notification::warning(format!(
                                     "Online providers unreachable: {}",
@@ -524,7 +712,7 @@ impl WallzyApp {
                                 )),
                                 cx,
                             );
-                        } else {
+                        } else if notify_errors {
                             win.push_notification(
                                 Notification::info("No matching online wallpapers found"),
                                 cx,
@@ -576,11 +764,12 @@ impl WallzyApp {
         let auto_apply = apply_after || self.settings.auto_apply_after_download;
         let win_handle = window.window_handle();
         let wp_id = wp.id.clone();
+        let cached_hd = self.hd_cache.get(&wp.id);
 
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { execute_download(&wp, &dest) })
+                .spawn(async move { execute_download_with_cache(&wp, &dest, cached_hd.as_deref()) })
                 .await;
 
             let _ = this.update(cx, |app, cx| {
@@ -730,7 +919,7 @@ impl WallzyApp {
         cx.notify();
     }
 
-    pub fn step_preview(&mut self, delta: isize, cx: &mut Context<Self>) {
+    pub fn step_preview(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(current_id) = &self.preview_id else {
             return;
         };
@@ -738,7 +927,25 @@ impl WallzyApp {
         if let Some(pos) = visible.iter().position(|w| &w.id == current_id) {
             let next = pos as isize + delta;
             if next >= 0 && (next as usize) < visible.len() {
-                self.preview_id = Some(visible[next as usize].id.clone());
+                let next_id = visible[next as usize].id.clone();
+                // Drop GPU texture of items left more than 1 step away from the new preview index.
+                let mut stale_paths = Vec::new();
+                let next_idx = next as usize;
+                for offset in [-2isize, 2isize] {
+                    let far = next + offset;
+                    if far >= 0
+                        && (far as usize) < visible.len()
+                        && (far as usize).abs_diff(next_idx) > 1
+                    {
+                        let far_wp = &visible[far as usize];
+                        if let Some(p) = self.hd_cache.get(&far_wp.id) {
+                            stale_paths.push(p);
+                        }
+                    }
+                }
+                self.drop_preview_textures(stale_paths, window, cx);
+                self.preview_id = Some(next_id);
+                self.sync_hd_prefetch(window, cx);
                 cx.notify();
             }
         }
@@ -863,89 +1070,37 @@ impl WallzyApp {
         self.invalidate_visible_cache();
     }
 
-    fn render_title_bar(&self, palette: ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
-        let modes = [
-            (ThemeMode::Light, IconName::Sun, "Light"),
-            (ThemeMode::Dark, IconName::Moon, "Dark"),
-            (ThemeMode::System, IconName::Monitor, "System"),
-        ];
-
-        TitleBar::new()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text_primary)
-                            .child("Wallzy"),
-                    )
-                    .child(div().text_xs().text_color(palette.text_subtle).child("/"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.text_muted)
-                            .child(self.active_nav.label()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pr_2()
-                    // Compact Theme Polarity Toggle inside TitleBar
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .p_0p5()
-                            .rounded_lg()
-                            .bg(palette.bg_elevated)
-                            .border_1()
-                            .border_color(palette.hairline)
-                            .children(modes.into_iter().map(|(mode, icon, label)| {
-                                let active = self.settings.theme_mode == mode;
-                                div()
-                                    .id(format!("tb-theme-{}", label))
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .bg(if active {
-                                        palette.bg_surface
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .when(active, |s| s.shadow_sm())
-                                    .text_xs()
-                                    .text_color(if active {
-                                        palette.text_primary
-                                    } else {
-                                        palette.text_subtle
-                                    })
-                                    .hover(|s| s.text_color(palette.text_primary))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_theme_mode(mode, window, cx);
-                                    }))
-                                    .child(Icon::new(icon).size(px(12.0)))
-                                    .child(label)
-                            })),
-                    ),
-            )
+    fn render_title_bar(&self, palette: ThemePalette, _cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(palette.text_primary)
+                        .child("Wallzy"),
+                )
+                .child(div().text_xs().text_color(palette.text_subtle).child("/"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.text_muted)
+                        .child(self.active_nav.label()),
+                ),
+        )
     }
 }
 
 impl Render for WallzyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.needs_prefetch_sync && !self.scroll_animating {
+            self.needs_prefetch_sync = false;
+            self.sync_hd_prefetch(window, cx);
+        }
         let palette =
             ThemePalette::resolve(self.settings.theme_mode, self.settings.accent_color, window);
 
@@ -999,19 +1154,18 @@ impl Render for WallzyApp {
                     cx.notify();
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key.as_str() == "escape" {
                     if this.open_dropdown.is_some() {
                         this.open_dropdown = None;
                         cx.notify();
                     } else if this.preview_id.is_some() {
-                        this.preview_id = None;
-                        cx.notify();
+                        this.close_preview(window, cx);
                     }
                 } else if this.preview_id.is_some() {
                     match event.keystroke.key.as_str() {
-                        "left" => this.step_preview(-1, cx),
-                        "right" => this.step_preview(1, cx),
+                        "left" => this.step_preview(-1, window, cx),
+                        "right" => this.step_preview(1, window, cx),
                         _ => {}
                     }
                 }
@@ -1091,5 +1245,11 @@ fn fetch_cached_thumb(id: &str, url: &str, cache_dir: &Path) -> Option<PathBuf> 
     } else {
         let _ = fs::remove_file(&path);
         None
+    }
+}
+
+impl Drop for WallzyApp {
+    fn drop(&mut self) {
+        cleanup_temp_hd_cache();
     }
 }

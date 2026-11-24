@@ -50,8 +50,12 @@ pub fn target_path_for(wallpaper: &Wallpaper, download_dir: &Path) -> PathBuf {
     download_dir.join(format!("{}_{}.{}", stem, sanitize_id(&wallpaper.id), ext))
 }
 
-/// Downloads a remote wallpaper via system `curl`, or renders a high-res PNG for curated items.
-pub fn execute_download(wallpaper: &Wallpaper, dest: &Path) -> Result<DownloadOutcome, String> {
+/// Downloads or materializes a wallpaper, reusing a pre-fetched temporary HD file when available.
+pub fn execute_download_with_cache(
+    wallpaper: &Wallpaper,
+    dest: &Path,
+    cached_hd: Option<&Path>,
+) -> Result<DownloadOutcome, String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -65,6 +69,13 @@ pub fn execute_download(wallpaper: &Wallpaper, dest: &Path) -> Result<DownloadOu
     if let Some(local) = wallpaper.local_path.as_ref().filter(|p| p.exists()) {
         if local != dest {
             fs::copy(local, dest).map_err(|e| format!("Failed to copy local wallpaper: {}", e))?;
+        }
+    } else if wallpaper.source.is_remote()
+        && let Some(cached) = cached_hd.filter(|p| p.exists() && extensions_match(p, dest))
+    {
+        if cached != dest {
+            fs::copy(cached, dest)
+                .map_err(|e| format!("Failed to save cached HD wallpaper: {}", e))?;
         }
     } else if let Some(url) = wallpaper.download_url.as_deref()
         && wallpaper.source.is_remote()
@@ -83,6 +94,18 @@ pub fn execute_download(wallpaper: &Wallpaper, dest: &Path) -> Result<DownloadOu
         destination: dest.to_path_buf(),
         file_size_bytes: meta.len(),
     })
+}
+
+fn extensions_match(a: &Path, b: &Path) -> bool {
+    let ext_a = a
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let ext_b = b
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    ext_a.is_some() && ext_a == ext_b
 }
 
 fn download_via_curl(url: &str, dest: &Path) -> Result<(), String> {

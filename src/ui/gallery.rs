@@ -1,5 +1,6 @@
 use crate::app::WallzyApp;
 use crate::models::{NavSection, Wallpaper};
+use crate::services::preview_cache::{CARD_ROW_GAP, GRID_SIDE_CHROME, HERO_ROW_HEIGHT};
 use crate::theme::ThemePalette;
 use crate::ui::card::render_card;
 use gpui_kit::assets::IconName;
@@ -14,10 +15,6 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::rc::Rc;
 use std::time::Duration;
-
-const HERO_ROW_HEIGHT: f32 = 236.0;
-const CARD_ROW_GAP: f32 = 16.0;
-const GRID_SIDE_CHROME: f32 = 232.0 + 56.0;
 
 pub fn render_gallery(
     app: &WallzyApp,
@@ -125,6 +122,12 @@ pub fn render_gallery(
     }
 
     let items_rc = visible_wallpapers;
+    let hero_hd_override = if show_hero {
+        app.hero_image_override(&items_rc[0].id)
+    } else {
+        None
+    };
+
     let list_el = v_virtual_list(
         cx.entity(),
         "wallpaper-vlist",
@@ -136,6 +139,7 @@ pub fn render_gallery(
                     let hero_wp = items_rc[0].clone();
                     let hero = div().w_full().pb_5().child(render_hero_spotlight(
                         hero_wp,
+                        hero_hd_override.clone(),
                         mono_font.clone(),
                         palette,
                         cx,
@@ -199,6 +203,7 @@ pub fn render_gallery(
 
 fn render_hero_spotlight(
     wp: Wallpaper,
+    hero_override: Option<std::path::PathBuf>,
     mono_font: SharedString,
     palette: ThemePalette,
     cx: &mut Context<WallzyApp>,
@@ -206,7 +211,10 @@ fn render_hero_spotlight(
     let id_preview = wp.id.clone();
     let id_apply = wp.id.clone();
     let id_dl = wp.id.clone();
-    let image_path = wp.display_image_path().cloned();
+    let image_path = hero_override
+        .filter(|p| p.exists())
+        .or_else(|| wp.local_path.as_ref().filter(|p| p.exists()).cloned())
+        .or_else(|| wp.display_image_path().cloned());
 
     let hero = div()
         .id("hero-spotlight")
@@ -220,10 +228,8 @@ fn render_hero_spotlight(
         .border_color(palette.hairline_strong)
         .shadow_lg()
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.open_dropdown = None;
-            this.preview_id = Some(id_preview.clone());
-            cx.notify();
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_preview(id_preview.clone(), window, cx);
         }))
         .when_some(image_path, |this, path| {
             this.child(

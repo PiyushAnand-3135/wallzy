@@ -10,7 +10,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
+    application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
 
         let bounds = Bounds::centered(None, size(px(1340.0), px(860.0)), cx);

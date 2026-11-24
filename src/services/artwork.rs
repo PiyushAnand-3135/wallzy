@@ -37,6 +37,31 @@ pub fn ensure_curated_preview(wallpaper: &Wallpaper, cache_dir: &Path) -> Option
     }
 }
 
+/// Generates a crisp 720p HD preview image specifically for the Featured Hero Spotlight banner.
+pub fn ensure_curated_hero(wallpaper: &Wallpaper, cache_dir: &Path) -> Option<PathBuf> {
+    fs::create_dir_all(cache_dir).ok()?;
+    let safe_id: String = wallpaper
+        .id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = cache_dir.join(format!("{}_hero.png", safe_id));
+    if path.exists() {
+        return Some(path);
+    }
+    if render_wallpaper_png(wallpaper, 1280, 720, &path).is_ok() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Renders a smooth multi-layer procedural wallpaper PNG using the wallpaper's palette and category.
 pub fn render_wallpaper_png(
     wallpaper: &Wallpaper,
