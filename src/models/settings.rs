@@ -149,6 +149,15 @@ impl WallpaperFit {
     }
 }
 
+/// User-configured custom HTTP JSON wallpaper provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub endpoint_url: String,
+    pub enabled: bool,
+}
+
 /// Persisted application settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -159,12 +168,17 @@ pub struct AppSettings {
     pub wallpaper_fit: WallpaperFit,
     pub download_dir: PathBuf,
     pub local_library_dirs: Vec<PathBuf>,
+    pub enable_curated: bool,
+    pub enable_local: bool,
     pub enable_wallhaven: bool,
+    pub enable_alpha_coders: bool,
     pub enable_bing: bool,
     pub enable_reddit: bool,
     pub enable_wikimedia: bool,
     pub enable_nasa: bool,
     pub wallhaven_api_key: String,
+    pub alpha_coders_api_key: String,
+    pub custom_providers: Vec<CustomProviderConfig>,
     pub auto_apply_after_download: bool,
     pub show_resolution_badges: bool,
 }
@@ -172,10 +186,15 @@ pub struct AppSettings {
 impl AppSettings {
     pub fn has_any_online_provider(&self) -> bool {
         self.enable_wallhaven
+            || self.enable_alpha_coders
             || self.enable_bing
             || self.enable_reddit
             || self.enable_wikimedia
             || self.enable_nasa
+            || self
+                .custom_providers
+                .iter()
+                .any(|p| p.enabled && !p.endpoint_url.trim().is_empty())
     }
 }
 
@@ -193,12 +212,17 @@ impl Default for AppSettings {
             wallpaper_fit: WallpaperFit::Fill,
             download_dir,
             local_library_dirs: Vec::new(),
+            enable_curated: true,
+            enable_local: true,
             enable_wallhaven: true,
+            enable_alpha_coders: true,
             enable_bing: true,
             enable_reddit: true,
             enable_wikimedia: false,
             enable_nasa: true,
             wallhaven_api_key: String::new(),
+            alpha_coders_api_key: String::new(),
+            custom_providers: Vec::new(),
             auto_apply_after_download: false,
             show_resolution_badges: true,
         }

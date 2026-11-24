@@ -8,9 +8,11 @@ pub enum WallpaperSource {
     Local,
     Bing,
     Wallhaven,
+    AlphaCoders,
     Reddit,
     Wikimedia,
     Nasa,
+    Custom,
 }
 
 impl WallpaperSource {
@@ -20,9 +22,11 @@ impl WallpaperSource {
             Self::Local => "Local",
             Self::Bing => "Bing Daily",
             Self::Wallhaven => "Wallhaven",
+            Self::AlphaCoders => "Alpha Coders",
             Self::Reddit => "Reddit",
             Self::Wikimedia => "Wikimedia",
             Self::Nasa => "NASA",
+            Self::Custom => "Custom Feed",
         }
     }
 
@@ -36,9 +40,11 @@ impl WallpaperSource {
             Self::Local,
             Self::Bing,
             Self::Wallhaven,
+            Self::AlphaCoders,
             Self::Reddit,
             Self::Wikimedia,
             Self::Nasa,
+            Self::Custom,
         ]
     }
 }

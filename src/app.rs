@@ -1,6 +1,6 @@
 use crate::models::{
-    AccentColor, AppSettings, DownloadItem, DownloadStatus, GridDensity, NavSection, SortOrder,
-    ThemeMode, Wallpaper, WallpaperFilter, WallpaperFit, WallpaperSource,
+    AccentColor, AppSettings, CustomProviderConfig, DownloadItem, DownloadStatus, GridDensity,
+    NavSection, SortOrder, ThemeMode, Wallpaper, WallpaperFilter, WallpaperFit, WallpaperSource,
 };
 use crate::providers::curated::CuratedProvider;
 use crate::providers::local::LocalProvider;
@@ -68,6 +68,9 @@ pub struct WallzyApp {
     pub download_dir_input: Entity<InputState>,
     pub local_dir_input: Entity<InputState>,
     pub wallhaven_key_input: Entity<InputState>,
+    pub alpha_coders_key_input: Entity<InputState>,
+    pub custom_provider_name_input: Entity<InputState>,
+    pub custom_provider_url_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -107,6 +110,19 @@ impl WallzyApp {
                 state.set_value(settings.wallhaven_api_key.clone(), window, cx);
             }
             state
+        });
+        let alpha_coders_key_input = cx.new(|cx| {
+            let mut state =
+                InputState::new(window, cx).placeholder("Optional Alpha Coders API key");
+            if !settings.alpha_coders_api_key.is_empty() {
+                state.set_value(settings.alpha_coders_api_key.clone(), window, cx);
+            }
+            state
+        });
+        let custom_provider_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Provider name (e.g. Studio)"));
+        let custom_provider_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://example.com/wallpapers.json?q={query}")
         });
 
         let search_sub = cx.subscribe_in(
@@ -163,6 +179,9 @@ impl WallzyApp {
             download_dir_input,
             local_dir_input,
             wallhaven_key_input,
+            alpha_coders_key_input,
+            custom_provider_name_input,
+            custom_provider_url_input,
             _subscriptions: vec![search_sub, quit_sub],
         };
 
@@ -174,16 +193,24 @@ impl WallzyApp {
 
     /// Loads built-in curated wallpapers and scans configured local directories.
     pub fn reload_offline_catalog(&mut self) {
-        let curated = CuratedProvider::new(preview_cache_dir())
-            .fetch(&ProviderQuery::default())
-            .unwrap_or_default();
+        let curated = if self.settings.enable_curated {
+            CuratedProvider::new(preview_cache_dir())
+                .fetch(&ProviderQuery::default())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
-        let mut local_dirs = vec![self.settings.download_dir.clone()];
-        local_dirs.extend(self.settings.local_library_dirs.iter().cloned());
-        let local = LocalProvider::new(local_dirs)
-            .with_preview_cache(preview_cache_dir())
-            .fetch(&ProviderQuery::default())
-            .unwrap_or_default();
+        let local = if self.settings.enable_local {
+            let mut local_dirs = vec![self.settings.download_dir.clone()];
+            local_dirs.extend(self.settings.local_library_dirs.iter().cloned());
+            LocalProvider::new(local_dirs)
+                .with_preview_cache(preview_cache_dir())
+                .fetch(&ProviderQuery::default())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Keep any previously fetched remote wallpapers when refreshing local/curated items.
         let remote: Vec<Wallpaper> = self
@@ -1015,6 +1042,177 @@ impl WallzyApp {
         cx.notify();
     }
 
+    pub fn apply_alpha_coders_key_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.alpha_coders_api_key = self
+            .alpha_coders_key_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.persist_settings();
+        window.push_notification(Notification::success("Alpha Coders API key saved"), cx);
+        if self.settings.enable_alpha_coders && !self.is_fetching {
+            self.fetch_online_providers_inner(Some(window), true, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_offline_provider(
+        &mut self,
+        curated: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if curated {
+            self.settings.enable_curated = enabled;
+        } else {
+            self.settings.enable_local = enabled;
+        }
+        self.persist_settings();
+        self.reload_offline_catalog();
+        cx.notify();
+    }
+
+    pub fn toggle_online_provider(
+        &mut self,
+        source: WallpaperSource,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match source {
+            WallpaperSource::Bing => self.settings.enable_bing = enabled,
+            WallpaperSource::Wallhaven => self.settings.enable_wallhaven = enabled,
+            WallpaperSource::AlphaCoders => self.settings.enable_alpha_coders = enabled,
+            WallpaperSource::Reddit => self.settings.enable_reddit = enabled,
+            WallpaperSource::Wikimedia => self.settings.enable_wikimedia = enabled,
+            WallpaperSource::Nasa => self.settings.enable_nasa = enabled,
+            _ => return,
+        }
+        if !enabled {
+            self.wallpapers.retain(|w| w.source != source);
+            self.invalidate_visible_cache();
+        } else if !self.is_fetching {
+            self.fetch_online_providers_inner(Some(window), true, cx);
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    pub fn add_custom_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .custom_provider_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let endpoint_url = self
+            .custom_provider_url_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+
+        if name.is_empty() {
+            window.push_notification(
+                Notification::warning("Enter a name for the custom provider"),
+                cx,
+            );
+            return;
+        }
+        if !(endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://")) {
+            window.push_notification(
+                Notification::warning("Custom endpoint URL must start with http:// or https://"),
+                cx,
+            );
+            return;
+        }
+
+        let base_slug: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let base = base_slug.trim_matches('-');
+        let base_id = if base.is_empty() { "feed" } else { base };
+        let mut id = base_id.to_string();
+        let mut suffix = 2usize;
+        while self.settings.custom_providers.iter().any(|p| p.id == id) {
+            id = format!("{}-{}", base_id, suffix);
+            suffix += 1;
+        }
+
+        self.settings.custom_providers.push(CustomProviderConfig {
+            id,
+            name: name.clone(),
+            endpoint_url,
+            enabled: true,
+        });
+        self.persist_settings();
+
+        self.custom_provider_name_input
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        self.custom_provider_url_input
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+
+        window.push_notification(
+            Notification::success(format!("Added custom provider \"{}\"", name)),
+            cx,
+        );
+        if !self.is_fetching {
+            self.fetch_online_providers_inner(Some(window), true, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_custom_provider(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cfg) = self.settings.custom_providers.get_mut(index) else {
+            return;
+        };
+        cfg.enabled = enabled;
+        let prefix = format!("custom-{}-", cfg.id);
+        self.persist_settings();
+
+        if !enabled {
+            self.wallpapers.retain(|w| !w.id.starts_with(&prefix));
+            self.invalidate_visible_cache();
+        } else if !self.is_fetching {
+            self.fetch_online_providers_inner(Some(window), true, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn remove_custom_provider(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index < self.settings.custom_providers.len() {
+            let removed = self.settings.custom_providers.remove(index);
+            let prefix = format!("custom-{}-", removed.id);
+            self.wallpapers.retain(|w| !w.id.starts_with(&prefix));
+            self.persist_settings();
+            self.invalidate_visible_cache();
+            window.push_notification(
+                Notification::info(format!("Removed provider \"{}\"", removed.name)),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
     pub fn reset_app_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = reset_all_persisted_data();
         self.settings = AppSettings::default();
@@ -1036,6 +1234,12 @@ impl WallzyApp {
         self.search_input
             .update(cx, |s, cx| s.set_value(String::new(), window, cx));
         self.wallhaven_key_input
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        self.alpha_coders_key_input
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        self.custom_provider_name_input
+            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        self.custom_provider_url_input
             .update(cx, |s, cx| s.set_value(String::new(), window, cx));
 
         self.reload_offline_catalog();

@@ -1,5 +1,7 @@
+pub mod alphacoders;
 pub mod bing;
 pub mod curated;
+pub mod custom;
 pub mod local;
 pub mod nasa;
 pub mod reddit;
@@ -29,6 +31,11 @@ pub trait WallpaperProvider: Send + Sync {
     /// Human-readable provider name displayed in the UI.
     fn display_name(&self) -> &'static str;
 
+    /// Owned display name (overridden by user-configured dynamic providers).
+    fn display_name_owned(&self) -> String {
+        self.display_name().to_string()
+    }
+
     /// Fetches wallpapers matching the requested query.
     fn fetch(&self, query: &ProviderQuery) -> Result<Vec<Wallpaper>, String>;
 }
@@ -43,6 +50,7 @@ pub fn registered_providers(
         Box::new(local::LocalProvider::new(local_dirs)),
         Box::new(bing::BingProvider),
         Box::new(wallhaven::WallhavenProvider),
+        Box::new(alphacoders::AlphaCodersProvider::default()),
         Box::new(reddit::RedditProvider),
         Box::new(wikimedia::WikimediaProvider),
         Box::new(nasa::NasaProvider),
@@ -65,6 +73,11 @@ pub fn fetch_enabled_online(
     if settings.enable_wallhaven {
         active.push(Box::new(wallhaven::WallhavenProvider));
     }
+    if settings.enable_alpha_coders {
+        active.push(Box::new(alphacoders::AlphaCodersProvider::new(
+            settings.alpha_coders_api_key.clone(),
+        )));
+    }
     if settings.enable_reddit {
         active.push(Box::new(reddit::RedditProvider));
     }
@@ -73,6 +86,11 @@ pub fn fetch_enabled_online(
     }
     if settings.enable_nasa {
         active.push(Box::new(nasa::NasaProvider));
+    }
+    for custom in &settings.custom_providers {
+        if custom.enabled && !custom.endpoint_url.trim().is_empty() {
+            active.push(Box::new(custom::CustomJsonProvider::new(custom.clone())));
+        }
     }
 
     if active.is_empty() {
@@ -86,7 +104,7 @@ pub fn fetch_enabled_online(
         let handles: Vec<_> = active
             .iter()
             .map(|provider| {
-                let name = provider.display_name();
+                let name = provider.display_name_owned();
                 let q = query.clone();
                 scope.spawn(move || (name, provider.fetch(&q)))
             })
